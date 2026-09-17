@@ -1,0 +1,33 @@
+{
+  "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "cached_revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+  "encoder_max_seq_length": 128,
+  "includes_special_tokens": true,
+  "embedding_dimensions": 384,
+  "pooling": "attention-mask-weighted mean",
+  "normalize_embeddings": true,
+  "encoder_finetuning": false,
+  "window_input": {
+    "order": "source text, then eligible reaction texts in canonical record order",
+    "separator": " ",
+    "character_limit": 6000,
+    "character_truncation": "retain leading characters",
+    "token_truncation": "encoder max_seq_length",
+    "chunking": false,
+    "empty_string": "all-zero 384-dimensional vector",
+    "batch_size_default": 64,
+    "assembly": "src/research/triage.py::_merge_window_text_features",
+    "encoding": "src/research/triage.py::_build_window_semantic_features"
+  },
+  "post_input": {
+    "unit": "individual selected canonical post text",
+    "character_limit": null,
+    "batch_size_recorded": 32,
+    "encoding": "src/research/text_models.py::_encode_with_prototypes"
+  },
+  "text_model_level": "light",
+  "optional_zero_shot_executed": false,
+  "prototype_definition": "src/research/text_models.py::PROTOTYPE_TEXTS",
+  "prototype_count": 5,
+  "similarity": "dot product of unit-normalized text and prototype vectors"
+}

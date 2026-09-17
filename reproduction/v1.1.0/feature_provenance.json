@@ -1,0 +1,95 @@
+{
+  "version": "v1.1.0",
+  "families": [
+    {
+      "family": "source stance and reaction types",
+      "inputs": [
+        "post text",
+        "dataset language"
+      ],
+      "construction": "Fixed keyword presence scores; query +1 for a question mark, evidence +2 for URL, emotion +1 for >=2 exclamation marks; tie order evidence, deny, query, emotion, other; all-zero scores give other.",
+      "example": "source_stance_type_deny: training-side one-hot indicator of source stance == deny",
+      "cutoff": "source text for source stance; corresponding admitted prefix record for reaction types",
+      "fitting": "fixed text rules; one-hot vocabulary from ranking training threads",
+      "source": [
+        "src/research/text_rules.py::classify_response",
+        "src/research/text_rules.py::extract_intervention_signals",
+        "src/research/triage.py::_feature_frame"
+      ]
+    },
+    {
+      "family": "publisher and correction descriptors",
+      "inputs": [
+        "post text",
+        "explicit adapter assignments",
+        "archived account verification"
+      ],
+      "construction": "CHECKED/CSDC source publisher=user and source is_correction=False. PHEME verification maps to official; otherwise expert, media, official text cues in priority order, then user. Correction cues use denial/evidence/action wording; explicit adapter assignments override inferred flags. Supplied corrections are separate records.",
+      "cutoff": "source descriptor or correction record admitted to the prefix; count/timestamp rules in the manuscript apply",
+      "fitting": "fixed adapter/text rules; training-side categorical vocabulary",
+      "source": [
+        "src/research/datasets/checked.py",
+        "src/research/datasets/csdc_rumor.py",
+        "src/research/datasets/pheme.py",
+        "src/research/text_rules.py::extract_intervention_signals"
+      ]
+    },
+    {
+      "family": "activity and cascade summaries",
+      "inputs": [
+        "linked interaction records",
+        "relative timestamps",
+        "rule-derived response/correction types"
+      ],
+      "construction": "Prefix counts, rates and response fractions; cascade adds nested windows, growth changes and censored first-event times.",
+      "cutoff": "current or earlier observable windows; target and final counts excluded from feature assembly",
+      "fitting": "deterministic counts; training-side scaling when used",
+      "source": [
+        "src/research/features.py",
+        "src/research/triage.py::_feature_frame"
+      ]
+    },
+    {
+      "family": "window embeddings and prototype similarities",
+      "inputs": [
+        "source and window reaction text",
+        "five fixed English prototype sentences"
+      ],
+      "construction": "6000-character assembled window, 128-token encoder, normalized mean-pooled embedding; cosine similarity to normalized prototypes; coordinate summaries.",
+      "cutoff": "current-window texts in canonical record order",
+      "fitting": "frozen pretrained MiniLM and fixed prototype sentences",
+      "source": [
+        "src/research/triage.py::_build_window_semantic_features",
+        "src/research/text_models.py::PROTOTYPE_TEXTS"
+      ],
+      "configuration": "reproduction/v1.1.0/minilm.json"
+    },
+    {
+      "family": "post/topic and six-hour correction summaries",
+      "inputs": [
+        "source-post texts",
+        "records flagged as early correction candidates with elapsed time <= 6h"
+      ],
+      "construction": "Aggregate frozen post embeddings by thread. For each outer split, fit separate K-means models to source-post embeddings and six-hour thread-text embeddings from the outer training threads, using min(8, training-thread count) clusters, seed 42 and n_init=auto. Apply the training centroids to both training and held-out threads to obtain cluster labels and centroid distances.",
+      "cutoff": "source-post summaries at each window; six-hour thread summaries admitted only at 6h/24h",
+      "fitting": "K-means, ranker, categorical layout and scaling use outer training threads; the encoder is frozen.",
+      "source": [
+        "src/research/text_models.py::_encode_with_prototypes",
+        "src/research/text_models.py::_aggregate_thread_text_features",
+        "src/research/text_models.py::_is_early_correction_candidate",
+        "src/research/triage.py::_merge_source_semantic_features",
+        "src/research/triage.py::_fit_transform_topic_features"
+      ]
+    },
+    {
+      "family": "optional zero-shot fields",
+      "inputs": [],
+      "construction": "Disabled in the light configuration. Optional score columns are zero-filled when assembled.",
+      "cutoff": "not an active descriptor in these runs",
+      "fitting": "no zero-shot classifier executed",
+      "source": [
+        "src/research/text_models.py::build_text_model_features"
+      ]
+    }
+  ]
+}

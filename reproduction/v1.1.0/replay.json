@@ -1,0 +1,59 @@
+{
+  "dataset": "PHEME",
+  "training": "historical source age >= 24 h; targets use only reactions strictly before replay start",
+  "evaluation_events": [
+    "prince-toronto-all-rnr-threads",
+    "gurlitt-all-rnr-threads",
+    "sydneysiege-all-rnr-threads",
+    "charliehebdo-all-rnr-threads",
+    "putinmissing-all-rnr-threads",
+    "germanwings-crash-all-rnr-threads"
+  ],
+  "initial_training_events": [
+    "ferguson-all-rnr-threads",
+    "ebola-essien-all-rnr-threads",
+    "ottawashooting-all-rnr-threads"
+  ],
+  "seeds": [
+    11,
+    13,
+    17
+  ],
+  "capacity_fractions": [
+    0.05,
+    0.1,
+    0.2
+  ],
+  "capacity_formula": "fraction * historical threads / sum(history event source span + 24 hours)",
+  "eligibility_age_hours": 1.0,
+  "expiry_age_hours": 48.0,
+  "scoring": "latest available 1/6/24 h prefix model on the log-remaining-growth score scale",
+  "baseline": "current visible reaction count; FIFO by source arrival",
+  "reward": "all recorded reactions strictly after actual review; common denominator reactions after age 1 h",
+  "service": {
+    "start": "min(source_hours) + 1",
+    "end": "max(source_hours) + 48",
+    "slots": "start + j / capacity for j = 0, ..., floor((end - start) * capacity)",
+    "reviews_per_slot": 1,
+    "empty_queue": "discard slot; no capacity carryover",
+    "eligibility": "not previously selected and 1 <= age <= 48",
+    "expiry": "age > 48",
+    "same_time_order": "determine eligibility and newest available snapshot at slot; reactions at slot count as observed",
+    "tie_break": [
+      "decreasing policy priority",
+      "increasing source arrival",
+      "increasing string thread ID"
+    ],
+    "stop": "last grid slot no later than end; no early stop for an empty queue"
+  },
+  "source": "src/research/replay.py",
+  "entrypoint": "scripts/replay_saved_scores.py",
+  "excluded_feature_groups": [
+    "topic"
+  ],
+  "score_update_ages_hours": [
+    1,
+    6,
+    24
+  ]
+}

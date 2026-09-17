@@ -1,6 +1,12 @@
 # Early Budgeted Rumor Triage
 
-This repository contains the code release for Early Budgeted Rumor Triage (EBRT), a pipeline for ranking rumor threads under limited review budgets using early response, cascade, and semantic evidence.
+This repository contains the code release for Early Budgeted Rumor Triage (EBRT), a pipeline for ranking rumor threads under limited review budgets using early response and semantic evidence, with a separate cascade representation for comparison.
+
+## Experiment configuration
+
+Version: **EBRT v1.1.0**.
+
+Feature definitions, text-encoder settings and calendar-time replay usage are documented in the [experiment reference](docs/reproducibility/experiments.md).
 
 ## Repository layout
 

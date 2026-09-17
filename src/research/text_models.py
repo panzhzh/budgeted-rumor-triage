@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
 
 from .feature_store import config_fingerprint, merge_unique_rows, read_parquet_frame, text_hash, write_frame
 from .io_utils import dump_json, ensure_dir
@@ -55,6 +54,7 @@ def build_text_model_features(
         "prototype_texts": PROTOTYPE_TEXTS,
         "zero_shot_labels": list(ZERO_SHOT_LABELS),
         "selection_rule": "source_posts_plus_early_correction_candidates_with_timestamp<=6h",
+        "feature_schema": "post_embeddings_v2",
     }
     fingerprint = config_fingerprint(config_payload)
 
@@ -119,16 +119,23 @@ def build_text_model_features(
     else:
         post_features = _ensure_post_feature_columns(post_features)
 
-    merged_post_store = merge_unique_rows(existing_post_features, post_features, key="cache_key")
-    write_frame(merged_post_store, parquet_path=post_feature_store)
-    post_features.to_csv(post_feature_csv, index=False)
-
     thread_features = _aggregate_thread_text_features(
         rows=rows,
         dataset_name=dataset_name,
         post_feature_frame=post_features,
         include_zero_shot=text_model_level == "heavy",
     )
+    merged_post_store = merge_unique_rows(existing_post_features, post_features, key="cache_key")
+    write_frame(merged_post_store, parquet_path=post_feature_store)
+    post_csv_columns = [
+        column
+        for column in post_features.columns
+        if not (
+            column.startswith("embedding_")
+            and column.removeprefix("embedding_").isdigit()
+        )
+    ]
+    post_features[post_csv_columns].to_csv(post_feature_csv, index=False)
     write_frame(thread_features, parquet_path=thread_feature_store, csv_path=thread_feature_csv)
 
     summary: dict[str, Any] = {
@@ -242,17 +249,18 @@ def _encode_with_prototypes(
             normalize_embeddings=True,
         )
         similarities = text_embeddings @ prototype_embeddings.T
-        topic_clusters, topic_distances = _fit_topic_clusters(text_embeddings)
-        for (row, hashed), embedding, sim_vector, cluster_id, distance_to_center in zip(
+        for (row, hashed), embedding, sim_vector in zip(
             row_payloads,
             text_embeddings,
             similarities,
-            topic_clusters,
-            topic_distances,
         ):
             scores = {
                 f"sim_{label}": round(float(score), 6)
                 for label, score in zip(prototype_labels, sim_vector.tolist())
+            }
+            coordinates = {
+                f"embedding_{index:03d}": float(value)
+                for index, value in enumerate(embedding)
             }
             encoded_rows.append(
                 _base_post_feature_row(
@@ -262,8 +270,7 @@ def _encode_with_prototypes(
                     {
                         "embedding_mean": round(float(np.mean(embedding)), 6),
                         "embedding_std": round(float(np.std(embedding)), 6),
-                        "topic_cluster": int(cluster_id),
-                        "topic_distance_to_center": round(float(distance_to_center), 6),
+                        **coordinates,
                         **scores,
                     },
                 )
@@ -436,6 +443,12 @@ def _aggregate_thread_text_features(
         return pd.DataFrame()
 
     feature_lookup = {}
+    embedding_columns = sorted(
+        column
+        for column in post_feature_frame.columns
+        if column.startswith("embedding_")
+        and column.removeprefix("embedding_").isdigit()
+    )
     if not post_feature_frame.empty:
         for _, row in post_feature_frame.iterrows():
             feature_lookup[str(row["post_id"])] = row.to_dict()
@@ -457,8 +470,10 @@ def _aggregate_thread_text_features(
                 "correction_text_length_sum": 0.0,
                 "prototype_sums": {label: 0.0 for label in PROTOTYPE_TEXTS},
                 "prototype_rows": 0,
-                "topic_cluster_counts": {},
-                "topic_distance_sum": 0.0,
+                "topic_embedding_sum": np.zeros(len(embedding_columns), dtype=float),
+                "topic_embedding_rows": 0,
+                "source_topic_embedding_sum": np.zeros(len(embedding_columns), dtype=float),
+                "source_topic_embedding_rows": 0,
                 "embedding_mean_sum": 0.0,
                 "embedding_std_sum": 0.0,
                 "zero_shot_sums": {label: 0.0 for label in ZERO_SHOT_LABELS},
@@ -480,9 +495,16 @@ def _aggregate_thread_text_features(
         state["prototype_rows"] += 1
         state["embedding_mean_sum"] += float(feature_row.get("embedding_mean") or 0.0)
         state["embedding_std_sum"] += float(feature_row.get("embedding_std") or 0.0)
-        state["topic_distance_sum"] += float(feature_row.get("topic_distance_to_center") or 0.0)
-        cluster = str(feature_row.get("topic_cluster") or "0")
-        state["topic_cluster_counts"][cluster] = state["topic_cluster_counts"].get(cluster, 0) + 1
+        if embedding_columns:
+            embedding = np.asarray(
+                [feature_row.get(column) for column in embedding_columns], dtype=float
+            )
+            if np.isfinite(embedding).all():
+                state["topic_embedding_sum"] += embedding
+                state["topic_embedding_rows"] += 1
+                if row.get("post_type") == "source":
+                    state["source_topic_embedding_sum"] += embedding
+                    state["source_topic_embedding_rows"] += 1
         for label in PROTOTYPE_TEXTS:
             state["prototype_sums"][label] += float(feature_row.get(f"sim_{label}") or 0.0)
         if include_zero_shot:
@@ -499,12 +521,18 @@ def _aggregate_thread_text_features(
     for thread_id, state in sorted(thread_state.items()):
         prototype_rows = max(int(state["prototype_rows"]), 1)
         zero_shot_rows = max(int(state["zero_shot_rows"]), 1)
-        dominant_topic_cluster = "0"
-        if state["topic_cluster_counts"]:
-            dominant_topic_cluster = max(
-                sorted(state["topic_cluster_counts"]),
-                key=lambda cluster: state["topic_cluster_counts"][cluster],
-            )
+        topic_embedding_rows = int(state["topic_embedding_rows"])
+        topic_embedding = (
+            state["topic_embedding_sum"] / topic_embedding_rows
+            if topic_embedding_rows
+            else np.full(len(embedding_columns), np.nan)
+        )
+        source_topic_embedding_rows = int(state["source_topic_embedding_rows"])
+        source_topic_embedding = (
+            state["source_topic_embedding_sum"] / source_topic_embedding_rows
+            if source_topic_embedding_rows
+            else np.full(len(embedding_columns), np.nan)
+        )
         dominant_proto = max(
             sorted(PROTOTYPE_TEXTS),
             key=lambda label: state["prototype_sums"][label],
@@ -528,9 +556,15 @@ def _aggregate_thread_text_features(
             "correction_text_count": int(state["correction_text_count"]),
             "source_embedding_mean": round(state["embedding_mean_sum"] / prototype_rows, 6),
             "source_embedding_std": round(state["embedding_std_sum"] / prototype_rows, 6),
-            "source_topic_cluster": dominant_topic_cluster,
-            "source_topic_distance": round(state["topic_distance_sum"] / prototype_rows, 6),
             "prototype_dominant_strategy": dominant_proto,
+            **{
+                f"topic_embedding_{index:03d}": float(value)
+                for index, value in enumerate(topic_embedding)
+            },
+            **{
+                f"source_topic_embedding_{index:03d}": float(value)
+                for index, value in enumerate(source_topic_embedding)
+            },
             **{
                 f"sim_{label}_mean": round(state["prototype_sums"][label] / prototype_rows, 6)
                 for label in PROTOTYPE_TEXTS
@@ -594,8 +628,6 @@ def _post_feature_columns() -> list[str]:
         "config_id",
         "embedding_mean",
         "embedding_std",
-        "topic_cluster",
-        "topic_distance_to_center",
         *[f"sim_{label}" for label in PROTOTYPE_TEXTS],
         *[f"zs_{label}" for label in ZERO_SHOT_LABELS],
     ]
@@ -621,19 +653,6 @@ def _torch_cuda_available() -> bool:
 
 def _resolve_text_model_device() -> str:
     return "cuda" if _torch_cuda_available() else "cpu"
-
-
-def _fit_topic_clusters(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    if embeddings.size == 0:
-        return np.array([], dtype=int), np.array([], dtype=float)
-    cluster_count = min(8, len(embeddings))
-    if cluster_count <= 1:
-        return np.zeros(len(embeddings), dtype=int), np.zeros(len(embeddings), dtype=float)
-    model = KMeans(n_clusters=cluster_count, random_state=42, n_init="auto")
-    labels = model.fit_predict(embeddings)
-    centers = model.cluster_centers_[labels]
-    distances = np.linalg.norm(embeddings - centers, axis=1)
-    return labels.astype(int), distances.astype(float)
 
 
 def _is_early_correction_candidate(row: dict[str, Any]) -> bool:

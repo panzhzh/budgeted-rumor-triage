@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -108,8 +109,6 @@ RUMOR_LABELS = {"fake", "rumour", "rumor", "false", "misinformation"}
 SOURCE_SEMANTIC_COLUMNS = (
     "embedding_mean",
     "embedding_std",
-    "topic_cluster",
-    "topic_distance_to_center",
     "sim_denial",
     "sim_evidence_explanation",
     "sim_action_guidance",
@@ -212,6 +211,7 @@ def _run_window_triage(
         train_idx, test_idx = _split_indices(working, high_growth, seed)
         train_df = working.loc[train_idx].reset_index(drop=True)
         test_df = working.loc[test_idx].reset_index(drop=True)
+        train_df, test_df = _fit_transform_topic_features(train_df, test_df)
 
         score_payloads = _baseline_scores(test_df, window, seed)
         score_payloads.extend(
@@ -350,13 +350,6 @@ def _merge_source_semantic_features(df: pd.DataFrame, text_model_dir: Path) -> p
                     .mean(numeric_only=True)
                     .rename(columns={column: f"source_sem_{column}" for column in numeric_cols})
                 )
-                if "topic_cluster" in semantic.columns:
-                    cluster = (
-                        semantic.groupby(["dataset", "thread_id"])["topic_cluster"]
-                        .agg(_mode_value)
-                        .reset_index(name="source_sem_topic_cluster")
-                    )
-                    grouped = grouped.merge(cluster, on=["dataset", "thread_id"], how="left")
                 merged = _merge_thread_level_features(merged, grouped)
 
     thread_path = text_model_dir / "thread_text_features.csv"
@@ -369,25 +362,82 @@ def _merge_source_semantic_features(df: pd.DataFrame, text_model_dir: Path) -> p
                 if column in {"dataset", "thread_id"}
                 or column.startswith("sim_")
                 or column.startswith("zs_")
+                or column.startswith("topic_embedding_")
+                or column.startswith("source_topic_embedding_")
                 or column
                 in {
                     "avg_source_text_length",
-                    "source_topic_cluster",
-                    "source_topic_distance",
                     "prototype_dominant_strategy",
                     "early_correction_strategy",
                 }
             ]
             thread_text = thread_text[keep_cols].copy()
-            rename_map = {
-                column: f"thread_text_{column}"
-                for column in thread_text.columns
-                if column not in {"dataset", "thread_id"}
-            }
+            rename_map = {}
+            for column in thread_text.columns:
+                if column in {"dataset", "thread_id"}:
+                    continue
+                if column.startswith("source_topic_embedding_"):
+                    suffix = column.removeprefix("source_topic_embedding_")
+                    rename_map[column] = f"__topic_source_embedding_{suffix}"
+                else:
+                    rename_map[column] = f"thread_text_{column}"
             thread_text = thread_text.rename(columns=rename_map)
             merged = _merge_thread_level_features(merged, thread_text)
 
     return merged
+
+
+def _fit_transform_topic_features(
+    train_df: pd.DataFrame,
+    heldout_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train = train_df.copy()
+    heldout = heldout_df.copy()
+    specifications = (
+        (
+            "__topic_source_embedding_",
+            "source_sem_topic_cluster",
+            "source_sem_topic_distance_to_center",
+        ),
+        (
+            "thread_text_topic_embedding_",
+            "thread_text_source_topic_cluster",
+            "thread_text_source_topic_distance",
+        ),
+    )
+    for prefix, cluster_column, distance_column in specifications:
+        columns = sorted(column for column in train.columns if column.startswith(prefix))
+        if not columns:
+            continue
+        train_values = train[columns].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+        heldout_values = heldout.reindex(columns=columns).apply(
+            pd.to_numeric, errors="coerce"
+        ).to_numpy(float)
+        train_valid = np.isfinite(train_values).all(axis=1)
+        heldout_valid = np.isfinite(heldout_values).all(axis=1)
+        valid_count = int(train_valid.sum())
+        train[cluster_column] = "missing"
+        heldout[cluster_column] = "missing"
+        train[distance_column] = 0.0
+        heldout[distance_column] = 0.0
+        if valid_count == 0:
+            continue
+        cluster_count = min(8, valid_count)
+        model = KMeans(n_clusters=cluster_count, random_state=42, n_init="auto")
+        model.fit(train_values[train_valid])
+        for frame, values, valid in (
+            (train, train_values, train_valid),
+            (heldout, heldout_values, heldout_valid),
+        ):
+            if not valid.any():
+                continue
+            labels = model.predict(values[valid])
+            centers = model.cluster_centers_[labels]
+            frame.loc[valid, cluster_column] = labels.astype(str)
+            frame.loc[valid, distance_column] = np.linalg.norm(
+                values[valid] - centers, axis=1
+            )
+    return train, heldout
 
 
 def _merge_thread_level_features(df: pd.DataFrame, feature_df: pd.DataFrame) -> pd.DataFrame:
@@ -1738,11 +1788,25 @@ def _validation_split(train_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
 
 
 def _ranking_metrics(y_future: np.ndarray, y_high: np.ndarray, scores: np.ndarray) -> dict[str, Any]:
-    if len(np.unique(y_high)) < 2 or len(np.unique(scores)) < 2:
-        return {"roc_auc": None, "average_precision": None}
+    labels = np.asarray(y_high)
+    values = np.asarray(scores, dtype=float)
+    if labels.ndim != 1 or values.ndim != 1 or len(labels) != len(values):
+        raise ValueError("Ranking labels and scores must be aligned one-dimensional arrays")
+    if not np.isfinite(values).all():
+        raise ValueError("Non-finite ranking scores")
+    if not np.isin(labels, [0, 1]).all():
+        raise ValueError("High-growth labels must be binary")
+    # Constant finite scores are valid: AUC=0.5 and AP=positive prevalence
+    # when both classes occur. Report AP as unavailable only with no positives.
     return {
-        "roc_auc": round(float(roc_auc_score(y_high, scores)), 4),
-        "average_precision": round(float(average_precision_score(y_high, scores)), 4),
+        "roc_auc": (
+            round(float(roc_auc_score(labels, values)), 4)
+            if len(np.unique(labels)) == 2 else None
+        ),
+        "average_precision": (
+            round(float(average_precision_score(labels, values)), 4)
+            if np.any(labels == 1) else None
+        ),
     }
 
 
@@ -1753,7 +1817,7 @@ def _budget_metrics(
     budget_fraction: float,
 ) -> dict[str, Any]:
     k = max(1, int(np.ceil(len(y_future) * budget_fraction)))
-    top_idx = np.argsort(scores)[::-1][:k]
+    top_idx = np.argsort(scores, kind="quicksort")[::-1][:k]
     captured = float(y_future[top_idx].sum())
     total = float(y_future.sum())
     precision = float(y_high[top_idx].mean()) if len(top_idx) else 0.0
@@ -1775,7 +1839,7 @@ def _capture_rate(y_future: np.ndarray, scores: np.ndarray, budget_fraction: flo
     if total <= 0:
         return 0.0
     k = max(1, int(np.ceil(len(y_future) * budget_fraction)))
-    top_idx = np.argsort(scores)[::-1][:k]
+    top_idx = np.argsort(scores, kind="quicksort")[::-1][:k]
     return float(y_future[top_idx].sum()) / total
 
 
